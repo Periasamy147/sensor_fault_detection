@@ -1,119 +1,99 @@
 import boto3
-import joblib
 import numpy as np
 import tensorflow as tf
-from collections import deque
-from sklearn.preprocessing import MinMaxScaler
 import time
-import json
-from datetime import datetime, timezone
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import StandardScaler
 
-# AWS DynamoDB Configuration
-dynamodb = boto3.client('dynamodb', region_name='ap-south-1')  # Change region as needed
-table_name = "TemperatureReadings"
+# ✅ Force TensorFlow to Run on CPU Only
+tf.config.set_visible_devices([], "GPU")
 
-# Load trained BiLSTM model
-print("✅ Loading model...")
-model = tf.keras.models.load_model("sensor_fault_model.keras")  # Use .keras format
-print("✅ Model loaded successfully!")
+# ✅ AWS Configuration
+AWS_REGION = "ap-south-1"
+DYNAMODB_TABLE = "TemperatureReadings"
 
-# Store last N readings for feature computation
-window_size = 5  # Adjust based on training data
-temperature_history = deque(maxlen=window_size)
+# ✅ Load BiLSTM Model
+MODEL_PATH = "bilstm_fault_detection.keras"
+model = load_model(MODEL_PATH)
 
-# Load the trained MinMaxScaler
-try:
-    scaler = joblib.load("scaler.pkl")  # Ensure scaler is properly trained
-    print("✅ Scaler loaded successfully!")
-except FileNotFoundError:
-    print("❌ Error: scaler.pkl not found. Ensure it's created in preprocess_data.py.")
-    exit()
+# ✅ Connect to DynamoDB
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+table = dynamodb.Table(DYNAMODB_TABLE)
 
-# Function to compute features
-def compute_features(temp):
+# ✅ Feature Scaler
+scaler = StandardScaler()
+
+# ✅ Prediction Threshold
+FAULT_THRESHOLD = 0.5  
+
+# ✅ Fetch Real-Time Data
+def fetch_latest_data():
     """
-    Computes meaningful features from temperature readings.
+    Fetch latest temperature readings from DynamoDB (last 60 seconds).
+    Uses alias `#ts` for `timestamp` to avoid reserved keyword error.
     """
-    temperature_history.append(temp)
+    time_threshold = datetime.now(timezone.utc) - timedelta(seconds=10)
+
+    response = table.scan(
+        FilterExpression="#ts >= :time",
+        ExpressionAttributeNames={"#ts": "timestamp"},  
+        ExpressionAttributeValues={":time": time_threshold.isoformat()},
+    )
+
+    items = response.get("Items", [])
+    return items
+
+# ✅ Fix: Ensure Correct Input Shape
+def preprocess_data(data):
+    """
+    Converts raw DynamoDB data into model-ready input.
+    """
+    if not data or len(data) < 10:  
+        return None  # ✅ Not enough data
+
+    df = pd.DataFrame(data)
     
-    if len(temperature_history) < window_size:
-        return None  # Not enough data yet
+    # ✅ Ensure correct data types
+    df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.dropna().sort_values(by="timestamp")  # ✅ Remove NaNs and sort
 
-    temp_array = np.array(temperature_history)
+    if len(df) < 10:
+        return None  # ✅ Still not enough data after cleaning
 
-    # Feature extraction
-    moving_avg = np.mean(temp_array)
-    rate_of_change = temp_array[-1] - temp_array[-2] if len(temp_array) > 1 else 0
-    std_dev = np.std(temp_array)
-    min_temp = np.min(temp_array)
-    max_temp = np.max(temp_array)
-    rolling_diff = np.diff(temp_array).mean() if len(temp_array) > 1 else 0
+    # ✅ Fix: Ensure exactly 10 readings (for time step consistency)
+    temp_values = df["temperature"].values[-10:].reshape(-1, 1)
 
-    return np.array([temp, moving_avg, rate_of_change, std_dev, min_temp, max_temp])
+    # ✅ Fix: Standardize and reshape correctly
+    temp_values = scaler.fit_transform(temp_values)
+    temp_values = np.array([temp_values])  # ✅ Shape must be (1, 10, 1)
 
-# Function to preprocess real-time data
-def preprocess_data(temp):
+    return temp_values
+
+# ✅ Predict Fault Function
+def predict_fault(data):
     """
-    Transforms raw temperature into a feature vector suitable for LSTM input.
+    Runs the BiLSTM model on processed data and prints fault status.
     """
-    features = compute_features(temp)
+    prediction = model.predict(data)
+    probability = prediction[0][0]
 
-    if features is None:
-        return None  # Skip prediction if not enough history
-
-    # Normalize using the trained scaler
-    try:
-        features = scaler.transform(features.reshape(1, -1))  
-    except ValueError as e:
-        print(f"❌ Error in scaler.transform: {e}")
-        return None
-
-    return features.reshape(1, 1, 6)  # Reshape for LSTM input
-
-# Function to fetch latest temperature data from DynamoDB
-def fetch_latest_temperature():
-    try:
-        response = dynamodb.scan(
-            TableName=table_name,
-            Limit=1,  
-            ScanFilter={
-                "timestamp": {
-                    "ComparisonOperator": "GT",
-                    "AttributeValueList": [{"S": "0"}]  # Fetch latest record
-                }
-            }
-        )
-        
-        items = response.get("Items", [])
-        if items:
-            return float(items[0]["temperature"]["N"])  # Convert to float
-    except Exception as e:
-        print(f"❌ Error fetching data from DynamoDB: {e}")
-
-    return None
-
-# Real-time fault detection loop
-print("🔍 Starting real-time fault detection...")
-
-while True:
-    temp = fetch_latest_temperature()
-    
-    if temp is not None:
-        input_data = preprocess_data(temp)
-        
-        if input_data is not None:
-            prediction = model.predict(input_data)
-            fault_label = np.argmax(prediction)  # Get predicted fault class
-            
-            # Display results
-            timestamp = datetime.now(timezone.utc).isoformat()  # ✅ Fixed timestamp
-            if fault_label != 0:  # Assuming 0 is "No Fault"
-                print(f"⏱️ {timestamp} | 🚨 SENSOR FAULT DETECTED (Class {fault_label})")
-            else:
-                print(f"⏱️ {timestamp} | ✅ No fault detected.")
-        else:
-            print("⚠️ Not enough data yet for prediction.")
+    if probability >= FAULT_THRESHOLD:
+        print(f"⚠️ FAULT DETECTED! Probability: {probability:.4f}")
     else:
-        print("⚠️ No new temperature data received.")
+        print(f"✅ NORMAL. Probability: {probability:.4f}")
 
-    time.sleep(2)  # Fetch data every 2 seconds
+# ✅ Real-Time Monitoring Loop
+print("\n🚀 **Real-time Fault Detection Started...**")
+while True:
+    raw_data = fetch_latest_data()
+    processed_data = preprocess_data(raw_data)
+
+    if processed_data is None:
+        print("⚠️ Not enough data yet... Waiting for more readings.")
+    else:
+        predict_fault(processed_data)
+
+    time.sleep(2)  
